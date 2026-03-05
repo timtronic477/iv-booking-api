@@ -5,6 +5,7 @@ from typing import List, Optional
 from datetime import datetime
 from decimal import Decimal
 from pydantic import BaseModel, EmailStr, ConfigDict
+from starlette.status import HTTP_201_CREATED
 
 from database import get_db, Base, engine
 from auth import get_current_user, get_password_hash, create_access_token, verify_password
@@ -42,6 +43,23 @@ class ServiceResponse(BaseModel):
     duration_minutes: int
     category: str
     is_active: bool
+
+class AppointmentCreate(BaseModel):
+    service_id: int
+    appointment_date: datetime
+    notes: Optional[str] = None
+
+class AppointmentResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    user_id: int
+    service_id: int
+    appointment_date: datetime
+    status: str
+    notes: Optional[str]
+    created_at: datetime
+
+    service: ServiceResponse
 
 @app.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -90,3 +108,107 @@ def get_service(service_id: int, db: Session = Depends(get_db)):
     if not service:
         raise HTTPException(status_code=404, detail="Service not found")
     return service
+
+
+#Appointment Endpoints
+@app.post("/appointments", response_model=AppointmentResponse, status_code=HTTP_201_CREATED)
+def create_appointment(
+        appointment:AppointmentCreate,
+        current_user: models.User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    service = db.query(models.Service).filter(models.Service.id==appointment.service_id).first()
+    if not service:
+        raise HTTPException(status_code=404, detail="Service not found")
+
+    exisitng = db.query(models.Appointment).filter(
+        models.Appointment.appointment_date == appointment.appointment_date,
+        models.Appointment.status == models.AppointmentStatus.scheduled
+    ).first()
+
+    if exisitng:
+        raise HTTPException(status_code=400, detail="Time slot already booked")
+
+    db_appointment = models.Appointment(
+        user_id = current_user.id,
+        service_id = appointment.service_id,
+        appointment_date = appointment.appointment_date,
+        notes = appointment.notes
+    )
+
+    db.add(db_appointment)
+    db.commit()
+    db.refresh(db_appointment)
+    return db_appointment
+
+@app.get('/appointments/my', response_model=List[AppointmentResponse])
+def get_my_appointments(
+        current_user: models.User =Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    appointments = db.query(models.Appointment).filter(
+        models.Appointment.user_id == current_user.id
+    ).order_by(models.Appointment.appointment_date.desc()).all()
+    return appointments
+
+@app.delete('/appointments/{appointment_id}')
+def cancel_appointment(
+        appointment_id: int,
+        current_user: models.User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+
+    appointment = db.query(models.Appointment).filter(
+        models.Appointment.id == appointment_id,
+        models.Appointment.user_id == current_user.id
+    ).first()
+
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    appointment.status = models.AppointmentStatus.canceled
+    db.commit()
+    return {"message": "Appointment canceled", "id": appointment_id}
+
+#Admin helper function
+def verify_admin(current_user: models.User = Depends(get_current_user)):
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+#Admin Endpoints
+@app.get("/admin/appointments/today", response_model=List[AppointmentResponse])
+def get_todays_appointments(
+        admin: models.User = Depends(verify_admin),
+        db: Session = Depends(get_db)
+):
+    from datetime import date as dt_date
+    today = dt_date.today()
+
+    appointments = db.query(models.Appointment).filter(
+        models.Appointment.appointment_date >= datetime.combine(today, datetime.min.time()),
+        models.Appointment.appointment_date < datetime.combine(today, datetime.max.time()),
+        models.Appointment.status == models.AppointmentStatus.scheduled
+    ).order_by(models.Appointment.appointment_date).all()
+
+    return appointments
+
+@app.get("/admin/appointments/all", response_model=List[AppointmentResponse])
+def get_all_appointments(
+        admin: models.User = Depends(verify_admin),
+        db: Session = Depends(get_db)
+):
+    appointments = db.query(models.Appointment).order_by(
+        models.Appointment.appointment_date.desc()
+    ).all()
+    return appointments
+
+@app.get("/admin/customers", response_model=List[UserResponse])
+def get_customers(
+        admin: models.User = Depends(verify_admin),
+        db: Session = Depends(get_db)
+):
+    customers = db.query(models.User).filter(
+        models.User.is_admin == False
+    ).all()
+    return customers
